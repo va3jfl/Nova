@@ -1,0 +1,21 @@
+# NOVA — Apache config for the folder where nova.html lives
+# These two headers enable "cross-origin isolation", which unlocks
+# SharedArrayBuffer → multithreaded WASM for the LLM brain.
+# Requires mod_headers (enabled on virtually all shared hosting).
+
+<IfModule mod_headers.c>
+  Header set Cross-Origin-Opener-Policy "same-origin"
+  # 'credentialless' (not 'require-corp') so the CDN scripts and
+  # HuggingFace model downloads keep working without CORP headers.
+  Header set Cross-Origin-Embedder-Policy "credentialless"
+</IfModule>
+
+# Correct MIME type in case the host doesn't know .wasm (only matters
+# if you ever self-host the engine files next to nova.html)
+AddType application/wasm .wasm
+
+# Optional: let browsers cache the big model files if you self-host any
+<IfModule mod_expires.c>
+  ExpiresActive On
+  ExpiresByType application/wasm "access plus 30 days"
+</IfModule>
