@@ -9,8 +9,9 @@
 <style>
 /* ============================================================
    NOVA — retro CRT robot assistant
-   Fully in-browser: LFM2-1.2B brain (wllama, multithreaded WASM)
-   + Whisper ears (transformers.js) + built-in speechSynthesis voice
+   Fully in-browser: Gemma-4 E2B brain (WebGPU kernels) with an automatic
+   LFM2 / wllama (WASM) fallback + Whisper ears (transformers.js)
+   + built-in speechSynthesis voice
    ============================================================ */
 :root{
   --face: #39ff88;              /* CRT phosphor color (settable) */
@@ -327,24 +328,26 @@ body{
   </details>
 
   <details class="grp"><summary>BRAIN &amp; EARS</summary>
-  <div class="set"><label>BRAIN (LLM — reload page after change)</label>
+  <div class="set"><label>BRAIN ENGINE (reload page after change)</label>
     <select id="setBrain">
-      <option value="https://huggingface.co/LiquidAI/LFM2-700M-GGUF/resolve/main/LFM2-700M-Q4_K_M.gguf">Fast — LFM2-700M (~470 MB)</option>
-      <option value="https://huggingface.co/LiquidAI/LFM2-1.2B-GGUF/resolve/main/LFM2-1.2B-Q4_K_M.gguf">Balanced — LFM2-1.2B (default, ~730 MB)</option>
-      <option value="https://huggingface.co/LiquidAI/LFM2-2.6B-GGUF/resolve/main/LFM2-2.6B-Q4_K_M.gguf">Smart — LFM2-2.6B (~1.6 GB)</option>
+      <option value="auto">Auto — Gemma-4 WebGPU, LFM2 fallback (default)</option>
+      <option value="gemma">Gemma-4 E2B — WebGPU only (fastest)</option>
+      <option value="https://huggingface.co/LiquidAI/LFM2-700M-GGUF/resolve/main/LFM2-700M-Q4_K_M.gguf">LFM2-700M — WASM fallback (~470 MB)</option>
+      <option value="https://huggingface.co/LiquidAI/LFM2-1.2B-GGUF/resolve/main/LFM2-1.2B-Q4_K_M.gguf">LFM2-1.2B — WASM fallback (~730 MB)</option>
+      <option value="https://huggingface.co/LiquidAI/LFM2-2.6B-GGUF/resolve/main/LFM2-2.6B-Q4_K_M.gguf">LFM2-2.6B — WASM fallback (~1.6 GB)</option>
     </select></div>
   <div class="set"><label>EARS (speech recognition — reload page after change)</label>
     <select id="setEars">
       <option value="tiny">Quick — whisper-tiny (default, ~40 MB)</option>
       <option value="base">Sharper — whisper-base (~150 MB)</option>
     </select></div>
-  <div class="set"><label>MAX REPLY TOKENS <span id="tokVal"></span></label>
-    <input type="range" id="setTokens" min="64" max="512" step="32"></div>
+  <div class="set"><label>MAX REPLY TOKENS <span id="tokVal"></span> <span style="opacity:.55">— higher = longer; asking "in detail" auto-extends</span></label>
+    <input type="range" id="setTokens" min="64" max="2048" step="32"></div>
   <div class="set"><label>PERSONA</label>
     <select id="setPersonaSel"></select></div>
   <div class="set"><label>PERSONA PROMPT (editing switches to Custom)</label>
     <textarea id="setPersona"></textarea></div>
-  <div class="set"><label>ADVANCED: BRAIN MODEL URL (.gguf — overrides the preset)</label>
+  <div class="set"><label>ADVANCED: LFM2 FALLBACK MODEL URL (.gguf)</label>
     <input type="url" id="setModel"></div>
   </details>
 
@@ -430,7 +433,8 @@ body{
    ├─ TTS (browser speechSynthesis)
    ├─ audio: mic → 16 kHz ring buffer (30 s) + VAD
    ├─ ASR: Whisper (transformers.js, local WASM/WebGPU)
-   ├─ LLM: LFM2-1.2B GGUF via wllama (multithreaded WASM llama.cpp)
+   ├─ LLM: Gemma-4 E2B on WebGPU (webml-community kernels), auto-falling
+   │        back to LFM2 GGUF via wllama (multithreaded WASM llama.cpp)
    └─ skills plugin registry  →  window.NOVA API
    ================================================================ */
 const $ = s => document.querySelector(s);
@@ -450,6 +454,10 @@ const PERSONAS = {
   'Custom': '',
 };
 const VOICE_RULES = " You are speaking out loud through a voice synthesizer, so keep replies short and conversational — one to three sentences unless asked for more — and never use markdown, emoji, or lists.";
+/* when the human explicitly asks for depth, one reply flips into long-form
+   "detail mode": the brevity rule is dropped and the token budget is lifted. */
+const DETAIL_RULES = " You are speaking out loud through a voice synthesizer, so use natural spoken sentences with no markdown, emoji, bullet points, or lists. The user has asked for depth this time, so give a complete, well-organized, genuinely detailed answer — take as many sentences as the topic needs and don't cut it short.";
+const DETAIL_RE = /\b(in detail|detailed|elaborate|expand|explain|more about|tell me more|at length|thorough(?:ly)?|comprehensive|everything about|walk me through|go deep(?:er)?|(?:long|longer|full|complete) (?:answer|version|explanation|rundown|breakdown)|deep dive|break (?:it|this) down|don'?t be brief|more detail)\b/i;
 
 const DEFAULTS = {
   wake: 'nova',
@@ -482,7 +490,8 @@ const DEFAULTS = {
   best: {},                       // game records (trivia)
   alarmTimes: [],                 // alarm timestamps, re-armed at boot
   customSkills: [],               // pasted plugin skill code
-  modelUrl: 'https://huggingface.co/LiquidAI/LFM2-1.2B-GGUF/resolve/main/LFM2-1.2B-Q4_K_M.gguf',
+  brainEngine: 'auto',            // 'auto' = Gemma-4 WebGPU + LFM2 fallback | 'gemma' = WebGPU only | 'lfm2' = force wllama
+  modelUrl: 'https://huggingface.co/LiquidAI/LFM2-1.2B-GGUF/resolve/main/LFM2-1.2B-Q4_K_M.gguf',  // LFM2 model used by the fallback brain
 };
 /* storage: session-only by default; the "remember between visits" toggle
    switches to localStorage (and turning it off wipes the stored copy) */
@@ -1038,8 +1047,84 @@ async function handleCommand(audio, presetText){
   }
 }
 
-/* ---------------- LLM brain: LFM2-1.2B on wllama ---------------- */
-/* PINNED to 2.3.7 — do not bump to 3.x yet. All wllama 3.x releases (through
+/* ---------------- LLM brain: Gemma-4 E2B (WebGPU) + LFM2 (wllama) fallback ----------------
+   Primary brain is Gemma-4 E2B running on WebGPU via webml-community's
+   "gemma-4-webgpu-kernels" module — self-contained WGSL compute kernels
+   (no wasm), dramatically faster than WASM llama.cpp on any GPU. When WebGPU
+   is missing, or that module fails to load, we fall back to the original
+   LFM2-on-wllama brain so every browser still gets a brain.
+
+   Both engines are normalised behind one `brain` object:
+       brain.run(messages, { maxTokens, onPartial, signal }) -> Promise<fullText>
+   where `messages` is the usual [{role, content}] array. That keeps llmChat,
+   llmOnce, brainRespond and every skill working unchanged across both brains.
+   `brain` being non-null also doubles as the "is the brain up?" flag. */
+const GEMMA_MODULE_URL = 'https://webml-community-gemma-4-webgpu-kernels.static.hf.space/gemma-4-e2b.js';
+
+let brain  = null;      // active normalised brain (see run() contract above) — also the "loaded?" flag
+let gemma  = null;      // Gemma4Mobile instance when the WebGPU brain is active
+let wllama = null;      // Wllama instance when the fallback brain is active
+const history = [];     // rolling chat memory (in RAM only)
+
+/* Gemma models have no system role — fold any system message(s) into the first
+   user turn (the standard Gemma pattern) and keep strict user/model alternation. */
+function toGemmaMessages(messages){
+  const out = []; let sys = '';
+  for (const m of messages){
+    if (m.role === 'system'){ sys += (sys ? '\n\n' : '') + m.content; continue; }
+    if (sys && m.role === 'user'){ out.push({ role: 'user', content: sys + '\n\n' + m.content }); sys = ''; }
+    else out.push({ role: m.role, content: m.content });
+  }
+  if (sys) out.push({ role: 'user', content: sys });   // system present but no trailing user (rare)
+  return out;
+}
+
+/* ---- primary brain: Gemma-4 E2B on WebGPU ---- */
+async function initGemma(){
+  if (!navigator.gpu) throw new Error('WebGPU unavailable');
+  bootProgress('> neural core:', 'WebGPU detected — connecting…');
+  const { Gemma4Mobile } = await import(GEMMA_MODULE_URL);
+  const onProgress = ev => {                     // { status, fraction, loaded, total, fromCache, message }
+    try {
+      if (!ev) return;
+      if (ev.status && ev.status !== 'weights'){ // setup phases (adapter, kernels, tokenizer…)
+        const pct = Number.isFinite(ev.fraction) ? `  ${Math.round(ev.fraction * 100)}%` : '…';
+        bootProgress('> neural core:', String(ev.message || ev.status) + pct);
+        return;
+      }
+      const frac = Number.isFinite(ev.fraction) ? ev.fraction
+                 : (ev.total ? ev.loaded / ev.total : null);
+      if (ev.total)
+        bootProgress('> neural core:', `${(ev.loaded/1048576).toFixed(0)} / ${(ev.total/1048576).toFixed(0)} MB  [${'▓'.repeat(Math.round((frac || 0) * 18)).padEnd(18,'░')}]${ev.fromCache ? ' (cache)' : ''}`);
+      else if (frac != null)
+        bootProgress('> neural core:', `weights  ${Math.round(frac * 100)}%`);
+    } catch(_){}
+  };
+  gemma = await Gemma4Mobile.load(null, { onProgress });
+  await gemma.warmup();
+  brain = {
+    kind: 'gemma', label: 'GEMMA-4 E2B (WebGPU)', engine: gemma,
+    async run(messages, { maxTokens = 256, signal, onPartial } = {}){
+      // reset + resend the whole (windowed) conversation each turn: correct
+      // regardless of the engine's internal KV-cache behaviour. Memory is
+      // preserved via the messages we pass, not via engine state.
+      try { gemma.reset?.(); } catch(_){}
+      const stream = gemma.generate(toGemmaMessages(messages), { maxNewTokens: maxTokens, signal });
+      let full = '';
+      for await (const chunk of stream){         // each chunk yields the cumulative text
+        const t = chunk && typeof chunk === 'object'
+          ? (chunk.text ?? '') : (typeof chunk === 'string' ? chunk : '');
+        if (t){ full = t; onPartial?.(full); }
+      }
+      return full;
+    },
+    reset(){ try { gemma.reset?.(); } catch(_){} },
+  };
+  bootProgress('> neural core:', 'GEMMA-4 E2B ONLINE ✓ (WebGPU)');
+}
+
+/* ---- fallback brain: LFM2 on wllama (multithreaded WASM llama.cpp) ----
+   PINNED to 2.3.7 — do not bump to 3.x yet. All wllama 3.x releases (through
    3.5.1) ship a single wasm64 (memory64) build that contains an i64 atomic on
    an address that isn't always 8-byte aligned; when the allocator lands it on
    a 4-byte boundary the whole engine dies with
@@ -1051,10 +1136,8 @@ async function handleCommand(audio, presetText){
    supports the LFM2 architecture — verified with LFM2-1.2B-Q4_K_M,
    multithreaded, in both Firefox and Chromium. */
 const WLLAMA_CDN = 'https://cdn.jsdelivr.net/npm/@wllama/wllama@2.3.7/';
-let wllama = null;
-const history = [];                              // rolling chat memory (in RAM only)
 
-async function initLLM(opts = {}){
+async function initWllama(url, opts = {}){
   const { Wllama } = await import(WLLAMA_CDN + 'esm/index.js');
   const paths = {                                // wllama 2.x dual builds (wasm32)
     'single-thread/wllama.wasm': WLLAMA_CDN + 'esm/single-thread/wllama.wasm',
@@ -1071,41 +1154,72 @@ async function initLLM(opts = {}){
     if (total) bootProgress('> neural core:', `${(loaded/1048576).toFixed(0)} / ${(total/1048576).toFixed(0)} MB  [${'▓'.repeat(Math.round(loaded/total*18)).padEnd(18,'░')}]`);
   };
   bootProgress('> neural core:', 'connecting…');
-  await wllama.loadModelFromUrl(S.modelUrl, { n_ctx: 2048, progressCallback: prog, useCache: true });
-  bootProgress('> neural core:', 'LFM2-1.2B ONLINE ✓');
+  await wllama.loadModelFromUrl(url || S.modelUrl, { n_ctx: 2048, progressCallback: prog, useCache: true });
+  brain = {
+    kind: 'wllama', label: 'LFM2 (WASM)', engine: wllama,
+    async run(messages, { maxTokens = 224, onPartial } = {}){
+      let text = '';
+      try {                                      // wllama 2.x native: (messages, options) + onNewToken streaming
+        text = await wllama.createChatCompletion(messages, {
+          nPredict: maxTokens,
+          sampling: { temp: 0.6, top_p: 0.9 },
+          onNewToken: (tok, piece, currentText) => { onPartial?.(currentText); },
+        });
+      } catch(e){                                // fallback: OpenAI-style object signature (wllama 3.x+)
+        console.warn('v2 API failed, trying OpenAI-style signature', e);
+        const res = await wllama.createChatCompletion({
+          messages, max_tokens: maxTokens, temperature: 0.6, top_p: 0.9, stream: true,
+        });
+        if (res && typeof res[Symbol.asyncIterator] === 'function'){
+          for await (const chunk of res){
+            const piece = chunk?.choices?.[0]?.delta?.content
+                       ?? (typeof chunk === 'string' ? chunk : '');
+            if (piece){ text += piece; onPartial?.(text); }
+            else if (chunk?.currentText){ text = chunk.currentText; onPartial?.(text); }
+          }
+        } else if (typeof res === 'string') text = res;
+        else text = res?.choices?.[0]?.message?.content || '';
+      }
+      return text;
+    },
+    reset(){},
+  };
+  bootProgress('> neural core:', 'LFM2 ONLINE ✓');
+}
+
+/* pick the brain: Gemma (WebGPU) first, LFM2 (wllama) as the safety net */
+async function initLLM(opts = {}){
+  const pref = S.brainEngine || 'auto';
+  const wantGemma = pref === 'auto' || pref === 'gemma';
+  if (wantGemma){
+    if (navigator.gpu){
+      try { await initGemma(); return; }
+      catch(e){
+        console.warn('Gemma WebGPU brain failed', e);
+        if (pref === 'gemma') throw e;           // user forced Gemma → surface the failure (retry button)
+        bootProgress('> neural core:', 'WebGPU brain unavailable — falling back to LFM2…');
+        await new Promise(r => setTimeout(r, 700));
+      }
+    } else if (pref === 'gemma'){
+      throw new Error('WebGPU not available — Gemma needs Chrome, Edge, or Safari 18+');
+    } else {
+      bootLog('> neural core: no WebGPU — using LFM2 (wllama) fallback');
+    }
+  }
+  await initWllama(S.modelUrl, opts);            // forced LFM2, or the auto fallback path
 }
 
 async function llmChat(userText, onPartial, historyAs){
   const facts = (S.facts || []).slice(-12).map(f => '- ' + f).join('\n');
+  const detail = DETAIL_RE.test(historyAs || userText);      // did the human ask for depth this turn?
+  const budget = detail ? Math.max(S.maxTokens, 1024) : S.maxTokens;
   const messages = [
-    { role: 'system', content: S.persona + VOICE_RULES +
+    { role: 'system', content: S.persona + (detail ? DETAIL_RULES : VOICE_RULES) +
       (facts ? '\n\nFacts the user asked you to remember (use them when relevant):\n' + facts : '') },
     ...history.slice(-8),
     { role: 'user', content: userText },
   ];
-  let text = '';
-  try {                                          // wllama 2.x native: (messages, options) + onNewToken streaming
-    text = await wllama.createChatCompletion(messages, {
-      nPredict: S.maxTokens,
-      sampling: { temp: 0.6, top_p: 0.9 },
-      onNewToken: (tok, piece, currentText) => { onPartial?.(currentText); },
-    });
-  } catch(e){                                    // fallback: OpenAI-style object signature (wllama 3.x+)
-    console.warn('v2 API failed, trying OpenAI-style signature', e);
-    const res = await wllama.createChatCompletion({
-      messages, max_tokens: S.maxTokens, temperature: 0.6, top_p: 0.9, stream: true,
-    });
-    if (res && typeof res[Symbol.asyncIterator] === 'function'){
-      for await (const chunk of res){
-        const piece = chunk?.choices?.[0]?.delta?.content
-                   ?? (typeof chunk === 'string' ? chunk : '');
-        if (piece){ text += piece; onPartial?.(text); }
-        else if (chunk?.currentText){ text = chunk.currentText; onPartial?.(text); }
-      }
-    } else if (typeof res === 'string') text = res;
-    else text = res?.choices?.[0]?.message?.content || '';
-  }
-  text = (text || '').trim();
+  const text = ((await brain.run(messages, { maxTokens: budget, onPartial })) || '').trim();
   // store the human's words in memory, not any skill-data blob wrapped around them
   history.push({ role: 'user', content: historyAs || userText }, { role: 'assistant', content: text });
   while (history.length > 16) history.shift();
@@ -1182,7 +1296,7 @@ const debugState = {};             // NOVA.debug — inspect the last skill→br
 async function brainRespond(userText, skillName, data){
   const blob = typeof data === 'string' ? data : JSON.stringify(data);
   debugState.brain = { skill: skillName, userText, data: blob };
-  if (!wllama){                                   // brain not loaded — degrade gracefully
+  if (!brain){                                    // brain not loaded — degrade gracefully
     const fallback = typeof data === 'string' && blob.length < 240
       ? blob : "I've got the data, but my brain isn't finished loading yet, so I can't sum it up.";
     addChat('bot', fallback); showExchange(userText, fallback);
@@ -1199,24 +1313,14 @@ async function brainRespond(userText, skillName, data){
 
 /* one-shot LLM call for plugins: no conversation memory, returns raw text (null if brain not loaded) */
 async function llmOnce(prompt, system){
-  if (!wllama) return null;
+  if (!brain) return null;
   const messages = [
     { role: 'system', content: system || (S.persona + VOICE_RULES) },
     { role: 'user', content: prompt },
   ];
-  try {                                          // wllama 2.x native signature
-    const res = await wllama.createChatCompletion(messages, {
-      nPredict: S.maxTokens, sampling: { temp: 0.6, top_p: 0.9 },
-    });
-    return (res || '').trim();
-  } catch(e){
-    try {                                        // fallback: OpenAI-style (wllama 3.x+)
-      const res = await wllama.createChatCompletion({
-        messages, max_tokens: S.maxTokens, temperature: 0.6, top_p: 0.9, stream: false,
-      });
-      return (typeof res === 'string' ? res : res?.choices?.[0]?.message?.content || '').trim();
-    } catch(e2){ console.warn('llmOnce', e2); return null; }
-  }
+  try {
+    return ((await brain.run(messages, { maxTokens: S.maxTokens })) || '').trim();
+  } catch(e){ console.warn('llmOnce', e); return null; }
 }
 
 /* ---------------- skills (the plugin system) ---------------- */
@@ -2077,12 +2181,12 @@ Skills.register({
   name: 'diagnostics', hint: '"run diagnostics" / "system status"',
   match: t => /\b(run (?:a )?diagnostics?|system (?:status|check|report)|self[ -]?test)\b/i.test(t) ? [1] : null,
   async run(m, ctx){
-    const ok = !!(wllama && earsReady() && micStream);
+    const ok = !!(brain && earsReady() && micStream);
     const lines = [
       'NOVA OS v' + window.NOVA.version + ' — SELF TEST',
       '──────────────────────────────',
-      'neural core ....... ' + (wllama ? 'LFM2-1.2B ONLINE' : 'OFFLINE'),
-      'threads ........... ' + (self.crossOriginIsolated ? 'MULTI ✓' : 'SINGLE'),
+      'neural core ....... ' + (brain ? brain.label : 'OFFLINE'),
+      'accelerator ....... ' + (brain?.kind === 'gemma' ? 'WebGPU ✓' : (self.crossOriginIsolated ? 'WASM threads ✓' : 'WASM single')),
       'ears .............. ' + (earsReady() ? `whisper-${S.asrModel} ONLINE${asrWorker ? ' (worker)' : ''}` : 'OFFLINE'),
       'voice ............. ' + voices.length + ' voices installed',
       'microphone ........ ' + (micStream ? (listening ? 'LIVE' : 'PAUSED') : 'UNAVAILABLE'),
@@ -2529,7 +2633,7 @@ async function handleUtterance(text){
   };
   const handled = await Skills.tryHandle(text, ctx);
   if (handled) return;
-  if (!wllama){
+  if (!brain){
     const msg = "My brain is still loading — give me a moment and try again.";
     addChat('bot', msg); showExchange(text, msg);
     return say(msg);
@@ -2823,11 +2927,12 @@ function syncSettingsUI(){
   $('#setDJCustom').value = S.djCustom;
   if (typeof buildDJChips === 'function') buildDJChips();
   const brainSel = $('#setBrain');
-  if (![...brainSel.options].some(o => o.value === S.modelUrl)){
-    const o = document.createElement('option'); o.value = S.modelUrl; o.textContent = 'Custom URL';
+  const bval = S.brainEngine === 'lfm2' ? S.modelUrl : (S.brainEngine || 'auto');
+  if (![...brainSel.options].some(o => o.value === bval)){
+    const o = document.createElement('option'); o.value = bval; o.textContent = 'Custom .gguf';
     brainSel.appendChild(o);
   }
-  brainSel.value = S.modelUrl;
+  brainSel.value = bval;
   $('#setSaver').value = S.saverMin;
   $('#saverVal').textContent = S.saverMin ? S.saverMin + ' min' : 'off';
   $('#setTokens').value = S.maxTokens; $('#tokVal').textContent = S.maxTokens;
@@ -2893,7 +2998,12 @@ function buildDJChips(){
     box.appendChild(d);
   });
 }
-$('#setBrain').onchange = e => { S.modelUrl = e.target.value; saveS(); syncSettingsUI(); toast('Brain changed — reload the page to load it'); };
+$('#setBrain').onchange = e => {
+  const v = e.target.value;
+  if (v === 'auto' || v === 'gemma') S.brainEngine = v;
+  else { S.brainEngine = 'lfm2'; S.modelUrl = v; }   // an LFM2/.gguf option forces the wllama brain
+  saveS(); syncSettingsUI(); toast('Brain changed — reload the page to load it');
+};
 $('#setEars').onchange = e => { S.asrModel = e.target.value; saveS(); toast('Ears changed — reload the page to load them'); };
 $('#setBargeIn').onchange = e => { S.bargeIn = e.target.value === 'on'; saveS(); };
 $('#setPersist').onchange = e => {
@@ -2930,7 +3040,7 @@ $('#setPersonaSel').onchange = e => {
 };
 $('#setPersona').onchange = e => { S.persona = e.target.value; S.personaKey = 'Custom';
   PERSONAS['Custom'] = S.persona; saveS(); syncSettingsUI(); };
-$('#setModel').onchange = e => { S.modelUrl = e.target.value.trim(); saveS(); syncSettingsUI(); toast('Model URL saved — reload the page to load it'); };
+$('#setModel').onchange = e => { S.modelUrl = e.target.value.trim() || DEFAULTS.modelUrl; saveS(); syncSettingsUI(); toast('LFM2 fallback model saved — reload the page to load it'); };
 
 /* ---------------- public plugin API ---------------- */
 window.NOVA = {

@@ -1,11 +1,11 @@
 # NOVA — Browser Robot Assistant (v1.7)
 
 A fully in-browser voice assistant with a retro CRT robot face.
-Everything runs locally in the browser: LFM2 brain via wllama
-(multithreaded WASM llama.cpp), Whisper ears via transformers.js
-(in a Web Worker), and the browser's built-in speech for her voice.
-
-Live Demo: https://hamradiostudio.com/nova
+Everything runs locally in the browser: a Gemma-4 E2B brain on WebGPU
+(webml-community's gemma-4-webgpu-kernels), with an automatic fallback to
+LFM2 via wllama (multithreaded WASM llama.cpp) on machines without WebGPU;
+Whisper ears via transformers.js (in a Web Worker); and the browser's
+built-in speech for her voice.
 
 ## Files
 
@@ -17,7 +17,7 @@ Live Demo: https://hamradiostudio.com/nova
       manifest.json      list of skill files to load at boot
       *.js               9 example/starter skills incl. a template
 
-## Deploy (Apache, e.g. yourserver.net)
+## Deploy (Apache, e.g. citizenlink.net)
 
 Upload nova.html, .htaccess, proxy.php, and the skills/ folder into the
 same directory. That's it. The .htaccess sends the two headers
@@ -35,8 +35,10 @@ back to single-threaded mode and the /skills folder can't be read.
 ## First boot
 
 Press POWER ON, allow the microphone, and wait for the downloads
-(brain ~730 MB + ears ~40 MB, cached by the browser after the first
-time). Then say "Nova" — or use PUSH TO TALK (spacebar).
+(the Gemma-4 WebGPU brain streams its weights from Hugging Face on first
+boot, ears ~40 MB; both are cached by the browser afterwards — and if your
+browser lacks WebGPU, Nova falls back to the ~730 MB LFM2 brain instead).
+Then say "Nova" — or use PUSH TO TALK (spacebar).
 
 ## The basics
 
@@ -65,8 +67,16 @@ skills/manifest.json and reload. Only install skill files you trust.
 
 ## Models (settings → BRAIN & EARS)
 
-- Brain: LFM2-700M (fast) / LFM2-1.2B (default) / LFM2-2.6B (smart),
-  or any custom .gguf URL (2 GB max).
+- Brain engine: Auto (default) runs Gemma-4 E2B on WebGPU and falls back to
+  LFM2 on wllama when WebGPU isn't available. You can also force "Gemma-4
+  E2B (WebGPU only)", pin a specific LFM2 size (700M / 1.2B / 2.6B), or
+  point the advanced field at any custom .gguf URL (2 GB max) for the
+  fallback brain.
+- Gemma-4 needs WebGPU — a recent Chrome or Edge, or Safari 18+. The engine
+  module (gemma-4-e2b.js) loads from the webml-community Space and the model
+  weights stream from Hugging Face on first boot, then cache in the browser.
+  To self-host the engine instead, download gemma-4-e2b.js from that Space,
+  drop it beside nova.html, and change GEMMA_MODULE_URL to './gemma-4-e2b.js'.
 - Ears: whisper-tiny (default) or whisper-base (more accurate).
 
 NOVA is an experimental AI assistant — it can mishear and make mistakes.
